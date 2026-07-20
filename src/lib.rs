@@ -20,7 +20,6 @@ pub mod earcut;
 pub mod error;
 #[cfg(feature = "f64-interop")]
 pub mod f64;
-pub mod kernel;
 #[cfg(feature = "nd")]
 pub mod nd;
 pub mod polygon;

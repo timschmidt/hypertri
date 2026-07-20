@@ -7,7 +7,6 @@
 
 use crate::cdt_constraints;
 use crate::error::{Error, Result};
-use crate::kernel::{ExactKernel, Kernel};
 use crate::predicates;
 use crate::types::{Constraint, ExactPoint, Point2, Real, Triangle};
 use crate::types::{Sign, TriangleLocation};
@@ -184,10 +183,10 @@ impl ConstrainedDelaunayTriangulation {
 ///
 /// The local edge choices use the empty-circumcircle rule from Delaunay
 /// triangulation; the in-circle predicate is evaluated exactly through the
-/// crate-local kernel.
+/// shared `hyperlimit` predicate pipeline.
 pub fn delaunay(points: &[ExactPoint]) -> Result<DelaunayTriangulation> {
     validate_unique_points(points)?;
-    let triangles = delaunay_triangles::<ExactKernel>(points)?;
+    let triangles = delaunay_triangles(points)?;
     // Every construction branch admits only nondegenerate, positively
     // oriented triangles and makes each Delaunay choice with the exact
     // in-circle predicate. Re-running the public validator here would repeat
@@ -213,7 +212,7 @@ pub fn delaunay(points: &[ExactPoint]) -> Result<DelaunayTriangulation> {
 /// [`delaunay`].
 pub fn delaunay_spatial(points: &[ExactPoint]) -> Result<DelaunayTriangulation> {
     validate_unique_points(points)?;
-    let triangles = delaunay_triangles_spatial::<ExactKernel>(points)?;
+    let triangles = delaunay_triangles_spatial(points)?;
     Ok(DelaunayTriangulation::from_parts(
         points.to_vec(),
         triangles,
@@ -310,7 +309,7 @@ pub fn constrained_delaunay(
     }
 
     let base = delaunay(&points)?;
-    let triangles = crate::cdt_insert::insert_constraints::<ExactKernel>(
+    let triangles = crate::cdt_insert::insert_constraints(
         &points,
         base.triangles().to_vec(),
         &internal_constraints,
@@ -326,37 +325,28 @@ pub fn constrained_delaunay(
     Ok(triangulation)
 }
 
-fn delaunay_triangles<K>(points: &[Point2]) -> Result<Vec<Triangle>>
-where
-    K: Kernel,
-{
+fn delaunay_triangles(points: &[Point2]) -> Result<Vec<Triangle>> {
     match points.len() {
         0..=2 => Ok(Vec::new()),
-        3 => triangle_if_not_degenerate::<K>(points, [0, 1, 2])
+        3 => triangle_if_not_degenerate(points, [0, 1, 2])
             .map(|triangle| triangle.into_iter().collect()),
-        4 => delaunay_quad::<K>(points),
-        _ => incremental_delaunay::<K>(points),
+        4 => delaunay_quad(points),
+        _ => incremental_delaunay(points),
     }
 }
 
-fn delaunay_triangles_spatial<K>(points: &[Point2]) -> Result<Vec<Triangle>>
-where
-    K: Kernel,
-{
+fn delaunay_triangles_spatial(points: &[Point2]) -> Result<Vec<Triangle>> {
     match points.len() {
-        0..=4 => delaunay_triangles::<K>(points),
+        0..=4 => delaunay_triangles(points),
         _ => {
-            let order = brio_insertion_order::<K>(points)?;
-            incremental_delaunay_in_order::<K>(points, &order)
+            let order = brio_insertion_order(points)?;
+            incremental_delaunay_in_order(points, &order)
         }
     }
 }
 
-fn triangle_if_not_degenerate<K>(points: &[Point2], triangle: Triangle) -> Result<Option<Triangle>>
-where
-    K: Kernel,
-{
-    let sign = predicates::orient2d::<K>(
+fn triangle_if_not_degenerate(points: &[Point2], triangle: Triangle) -> Result<Option<Triangle>> {
+    let sign = predicates::orient2d(
         &points[triangle[0]],
         &points[triangle[1]],
         &points[triangle[2]],
@@ -364,23 +354,20 @@ where
     Ok((sign != Sign::Zero).then_some(oriented_triangle(sign, triangle)))
 }
 
-fn delaunay_quad<K>(points: &[Point2]) -> Result<Vec<Triangle>>
-where
-    K: Kernel,
-{
-    if let Some(triangles) = triangulate_interior_point::<K>(points)? {
+fn delaunay_quad(points: &[Point2]) -> Result<Vec<Triangle>> {
+    if let Some(triangles) = triangulate_interior_point(points)? {
         return Ok(triangles);
     }
 
     for diagonal in [(0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2)] {
         let (a, b, c, d) = diagonal;
-        let ac = predicates::orient2d::<K>(&points[a], &points[b], &points[c])?;
-        let ad = predicates::orient2d::<K>(&points[a], &points[b], &points[d])?;
+        let ac = predicates::orient2d(&points[a], &points[b], &points[c])?;
+        let ad = predicates::orient2d(&points[a], &points[b], &points[d])?;
         if !opposite_sides(ac, ad) {
             continue;
         }
 
-        if diagonal_is_delaunay::<K>(points, a, b, c, d)? {
+        if diagonal_is_delaunay(points, a, b, c, d)? {
             return Ok(vec![
                 oriented_triangle(ac, [a, b, c]),
                 oriented_triangle(ad.reversed(), [a, d, b]),
@@ -393,15 +380,12 @@ where
     })
 }
 
-fn triangulate_interior_point<K>(points: &[Point2]) -> Result<Option<Vec<Triangle>>>
-where
-    K: Kernel,
-{
+fn triangulate_interior_point(points: &[Point2]) -> Result<Option<Vec<Triangle>>> {
     for interior in 0..4 {
         let outer = (0..4)
             .filter(|&index| index != interior)
             .collect::<Vec<_>>();
-        let location = K::classify_point_triangle(
+        let location = predicates::classify_point_triangle(
             &points[outer[0]],
             &points[outer[1]],
             &points[outer[2]],
@@ -410,13 +394,13 @@ where
         match location {
             TriangleLocation::Inside => {
                 return Ok(Some(vec![
-                    make_oriented::<K>(points, [interior, outer[0], outer[1]])?,
-                    make_oriented::<K>(points, [interior, outer[1], outer[2]])?,
-                    make_oriented::<K>(points, [interior, outer[2], outer[0]])?,
+                    make_oriented(points, [interior, outer[0], outer[1]])?,
+                    make_oriented(points, [interior, outer[1], outer[2]])?,
+                    make_oriented(points, [interior, outer[2], outer[0]])?,
                 ]));
             }
             TriangleLocation::OnEdge => {
-                return triangulate_point_on_triangle_edge::<K>(
+                return triangulate_point_on_triangle_edge(
                     points,
                     interior,
                     [outer[0], outer[1], outer[2]],
@@ -431,22 +415,19 @@ where
     Ok(None)
 }
 
-fn triangulate_point_on_triangle_edge<K>(
+fn triangulate_point_on_triangle_edge(
     points: &[Point2],
     point: usize,
     triangle: Triangle,
-) -> Result<Vec<Triangle>>
-where
-    K: Kernel,
-{
+) -> Result<Vec<Triangle>> {
     for edge_index in 0..3 {
         let a = triangle[edge_index];
         let b = triangle[(edge_index + 1) % 3];
         let c = triangle[(edge_index + 2) % 3];
         if predicates::point_on_segment(&points[a], &points[b], &points[point])? {
             return Ok(vec![
-                make_oriented::<K>(points, [a, point, c])?,
-                make_oriented::<K>(points, [point, b, c])?,
+                make_oriented(points, [a, point, c])?,
+                make_oriented(points, [point, b, c])?,
             ]);
         }
     }
@@ -456,33 +437,21 @@ where
     })
 }
 
-fn diagonal_is_delaunay<K>(
-    points: &[Point2],
-    a: usize,
-    b: usize,
-    c: usize,
-    d: usize,
-) -> Result<bool>
-where
-    K: Kernel,
-{
-    let abc = predicates::orient2d::<K>(&points[a], &points[b], &points[c])?;
-    let abd = predicates::orient2d::<K>(&points[a], &points[b], &points[d])?;
-    let d_in_abc = incircle_inside::<K>(points, [a, b, c], d, abc)?;
-    let c_in_abd = incircle_inside::<K>(points, [a, d, b], c, abd.reversed())?;
+fn diagonal_is_delaunay(points: &[Point2], a: usize, b: usize, c: usize, d: usize) -> Result<bool> {
+    let abc = predicates::orient2d(&points[a], &points[b], &points[c])?;
+    let abd = predicates::orient2d(&points[a], &points[b], &points[d])?;
+    let d_in_abc = incircle_inside(points, [a, b, c], d, abc)?;
+    let c_in_abd = incircle_inside(points, [a, d, b], c, abd.reversed())?;
     Ok(!d_in_abc && !c_in_abd)
 }
 
-fn incircle_inside<K>(
+fn incircle_inside(
     points: &[Point2],
     triangle: Triangle,
     point: usize,
     orientation: Sign,
-) -> Result<bool>
-where
-    K: Kernel,
-{
-    let sign = K::incircle2d(
+) -> Result<bool> {
+    let sign = predicates::incircle2d(
         &points[triangle[0]],
         &points[triangle[1]],
         &points[triangle[2]],
@@ -494,20 +463,17 @@ where
     ))
 }
 
-fn incircle_inside_or_on_positive<K>(
+fn incircle_inside_or_on_positive(
     points: &[Point2],
     triangle: Triangle,
     point: usize,
-) -> Result<bool>
-where
-    K: Kernel,
-{
+) -> Result<bool> {
     // Incremental Bowyer-Watson insertion creates the seed and every cavity
     // replacement through `make_oriented`, so active triangles carry a
     // certified positive-orientation invariant. Reuse that object fact rather
     // than evaluating the orientation determinant again for every candidate
     // point/circumcircle pair.
-    let sign = K::incircle2d(
+    let sign = predicates::incircle2d(
         &points[triangle[0]],
         &points[triangle[1]],
         &points[triangle[2]],
@@ -516,29 +482,23 @@ where
     Ok(matches!(sign, Sign::Positive | Sign::Zero))
 }
 
-fn incremental_delaunay<K>(points: &[Point2]) -> Result<Vec<Triangle>>
-where
-    K: Kernel,
-{
-    incremental_delaunay_in_order::<K>(points, &(0..points.len()).collect::<Vec<_>>())
+fn incremental_delaunay(points: &[Point2]) -> Result<Vec<Triangle>> {
+    incremental_delaunay_in_order(points, &(0..points.len()).collect::<Vec<_>>())
 }
 
-fn incremental_delaunay_in_order<K>(
+fn incremental_delaunay_in_order(
     points: &[Point2],
     insertion_order: &[usize],
-) -> Result<Vec<Triangle>>
-where
-    K: Kernel,
-{
+) -> Result<Vec<Triangle>> {
     let mut work_points = points.to_vec();
     let first_super = work_points.len();
-    work_points.extend(super_triangle::<K>(points)?);
+    work_points.extend(super_triangle(points)?);
 
     // This is the Bowyer-Watson empty-circumcircle update: remove every
     // triangle whose circumcircle contains the inserted point, then stitch the
     // boundary cavity back to the point. The empty-circle test is evaluated by
-    // the exact predicate kernel.
-    let mut triangles = vec![make_oriented::<K>(
+    // the exact predicate pipeline.
+    let mut triangles = vec![make_oriented(
         &work_points,
         [first_super, first_super + 1, first_super + 2],
     )?];
@@ -547,7 +507,7 @@ where
         let mut bad = vec![false; triangles.len()];
         if triangles.len() >= LOCATED_CAVITY_THRESHOLD {
             let neighbors = triangle_neighbors(&triangles);
-            if let Some(seed) = locate_triangle::<K>(
+            if let Some(seed) = locate_triangle(
                 &work_points,
                 &triangles,
                 &neighbors,
@@ -561,7 +521,7 @@ where
                         continue;
                     }
                     visited[triangle_index] = true;
-                    if incircle_inside_or_on_positive::<K>(
+                    if incircle_inside_or_on_positive(
                         &work_points,
                         triangles[triangle_index],
                         point,
@@ -571,13 +531,13 @@ where
                     }
                 }
                 if !bad.iter().any(|is_bad| *is_bad) {
-                    mark_bad_triangles_exhaustive::<K>(&work_points, &triangles, point, &mut bad)?;
+                    mark_bad_triangles_exhaustive(&work_points, &triangles, point, &mut bad)?;
                 }
             } else {
-                mark_bad_triangles_exhaustive::<K>(&work_points, &triangles, point, &mut bad)?;
+                mark_bad_triangles_exhaustive(&work_points, &triangles, point, &mut bad)?;
             }
         } else {
-            mark_bad_triangles_exhaustive::<K>(&work_points, &triangles, point, &mut bad)?;
+            mark_bad_triangles_exhaustive(&work_points, &triangles, point, &mut bad)?;
         }
 
         let mut cavity = Vec::new();
@@ -596,7 +556,7 @@ where
             .collect();
 
         for edge in cavity {
-            match make_oriented::<K>(&work_points, [edge.from, edge.to, point]) {
+            match make_oriented(&work_points, [edge.from, edge.to, point]) {
                 Ok(triangle) => triangles.push(triangle),
                 Err(Error::InvalidInput {
                     reason: "degenerate triangle",
@@ -610,10 +570,7 @@ where
     Ok(triangles)
 }
 
-fn brio_insertion_order<K>(points: &[Point2]) -> Result<Vec<usize>>
-where
-    K: Kernel,
-{
+fn brio_insertion_order(points: &[Point2]) -> Result<Vec<usize>> {
     // A minimum first-round population avoids spending exact spatial-sort
     // comparisons on many tiny buckets. Above that floor, splitmix-assigned
     // levels produce the geometrically growing rounds of a biased randomized
@@ -632,7 +589,7 @@ where
 
     let mut order = Vec::with_capacity(points.len());
     for round in rounds.iter_mut().rev() {
-        spatial_median_order::<K>(points, round, false)?;
+        spatial_median_order(points, round, false)?;
         order.append(round);
     }
     Ok(order)
@@ -645,31 +602,25 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn spatial_median_order<K>(points: &[Point2], indices: &mut [usize], split_y: bool) -> Result<()>
-where
-    K: Kernel,
-{
+fn spatial_median_order(points: &[Point2], indices: &mut [usize], split_y: bool) -> Result<()> {
     if indices.len() <= 1 {
         return Ok(());
     }
 
     let midpoint = indices.len() / 2;
-    select_spatial_nth::<K>(points, indices, midpoint, split_y)?;
+    select_spatial_nth(points, indices, midpoint, split_y)?;
 
     let (lower, upper) = indices.split_at_mut(midpoint);
-    spatial_median_order::<K>(points, lower, !split_y)?;
-    spatial_median_order::<K>(points, &mut upper[1..], !split_y)
+    spatial_median_order(points, lower, !split_y)?;
+    spatial_median_order(points, &mut upper[1..], !split_y)
 }
 
-fn select_spatial_nth<K>(
+fn select_spatial_nth(
     points: &[Point2],
     indices: &mut [usize],
     nth: usize,
     compare_y_first: bool,
-) -> Result<()>
-where
-    K: Kernel,
-{
+) -> Result<()> {
     // `slice::select_nth_unstable_by` cannot propagate a fallible exact
     // comparison without making its comparator stateful and potentially
     // inconsistent after an error. This compact quickselect keeps comparison
@@ -683,7 +634,7 @@ where
         let pivot = indices[upper - 1];
         let mut split = lower;
         for candidate in lower..upper - 1 {
-            if spatial_point_cmp::<K>(points, indices[candidate], pivot, compare_y_first)?
+            if spatial_point_cmp(points, indices[candidate], pivot, compare_y_first)?
                 == std::cmp::Ordering::Less
             {
                 indices.swap(candidate, split);
@@ -700,15 +651,12 @@ where
     Ok(())
 }
 
-fn spatial_point_cmp<K>(
+fn spatial_point_cmp(
     points: &[Point2],
     left: usize,
     right: usize,
     compare_y_first: bool,
-) -> Result<std::cmp::Ordering>
-where
-    K: Kernel,
-{
+) -> Result<std::cmp::Ordering> {
     let (left_primary, left_secondary) = if compare_y_first {
         (&points[left].y, &points[left].x)
     } else {
@@ -719,24 +667,21 @@ where
     } else {
         (&points[right].x, &points[right].y)
     };
-    let primary = K::cmp(left_primary, right_primary)?;
+    let primary = predicates::compare_reals(left_primary, right_primary)?;
     if primary != std::cmp::Ordering::Equal {
         return Ok(primary);
     }
-    Ok(K::cmp(left_secondary, right_secondary)?.then(left.cmp(&right)))
+    Ok(predicates::compare_reals(left_secondary, right_secondary)?.then(left.cmp(&right)))
 }
 
-fn mark_bad_triangles_exhaustive<K>(
+fn mark_bad_triangles_exhaustive(
     points: &[Point2],
     triangles: &[Triangle],
     point: usize,
     bad: &mut [bool],
-) -> Result<()>
-where
-    K: Kernel,
-{
+) -> Result<()> {
     for (triangle_index, &triangle) in triangles.iter().enumerate() {
-        if incircle_inside_or_on_positive::<K>(points, triangle, point)? {
+        if incircle_inside_or_on_positive(points, triangle, point)? {
             bad[triangle_index] = true;
         }
     }
@@ -778,16 +723,13 @@ fn triangle_neighbors(triangles: &[Triangle]) -> Vec<[Option<usize>; 3]> {
     neighbors
 }
 
-fn locate_triangle<K>(
+fn locate_triangle(
     points: &[Point2],
     triangles: &[Triangle],
     neighbors: &[[Option<usize>; 3]],
     point: usize,
     seed: usize,
-) -> Result<Option<usize>>
-where
-    K: Kernel,
-{
+) -> Result<Option<usize>> {
     if triangles.is_empty() {
         return Ok(None);
     }
@@ -805,9 +747,7 @@ where
         .into_iter()
         .enumerate()
         {
-            if predicates::orient2d::<K>(&points[from], &points[to], &points[point])?
-                == Sign::Negative
-            {
+            if predicates::orient2d(&points[from], &points[to], &points[point])? == Sign::Negative {
                 crossed_edge = true;
                 let Some(neighbor) = neighbors[current][edge_index] else {
                     return Ok(None);
@@ -851,29 +791,27 @@ fn add_cavity_edge(edges: &mut Vec<Edge>, edge: Edge) {
     }
 }
 
-fn super_triangle<K>(points: &[Point2]) -> Result<[Point2; 3]>
-where
-    K: Kernel,
-{
-    let bounds = Bounds::from_points::<K>(points)?;
-    let dx = K::sub(&bounds.max_x, &bounds.min_x);
-    let dy = K::sub(&bounds.max_y, &bounds.min_y);
-    let span = if K::cmp(&dx, &dy)? == std::cmp::Ordering::Less {
+fn super_triangle(points: &[Point2]) -> Result<[Point2; 3]> {
+    let bounds = Bounds::from_points(points)?;
+    let dx = &bounds.max_x - &bounds.min_x;
+    let dy = &bounds.max_y - &bounds.min_y;
+    let span = if predicates::compare_reals(&dx, &dy)? == std::cmp::Ordering::Less {
         dy
     } else {
         dx
     };
-    let one = K::from_i64(1);
-    let two = K::from_i64(2);
-    let radius = K::add(&K::mul(&span, &K::from_i64(64)), &one);
-    let double_radius = K::mul(&radius, &two);
-    let mid_x = K::div(&K::add(&bounds.min_x, &bounds.max_x), &two)?;
-    let mid_y = K::div(&K::add(&bounds.min_y, &bounds.max_y), &two)?;
+    let scaled_span = &span * &Real::from(64);
+    let radius = &scaled_span + &Real::from(1);
+    let double_radius = &radius * &Real::from(2);
+    let midpoint = predicates::midpoint(
+        &Point2::new(bounds.min_x.clone(), bounds.min_y.clone()),
+        &Point2::new(bounds.max_x.clone(), bounds.max_y.clone()),
+    )?;
 
     Ok([
-        Point2::new(K::sub(&mid_x, &double_radius), K::sub(&mid_y, &radius)),
-        Point2::new(mid_x.clone(), K::add(&mid_y, &double_radius)),
-        Point2::new(K::add(&mid_x, &double_radius), K::sub(&mid_y, &radius)),
+        Point2::new(&midpoint.x - &double_radius, &midpoint.y - &radius),
+        Point2::new(midpoint.x.clone(), &midpoint.y + &double_radius),
+        Point2::new(&midpoint.x + &double_radius, &midpoint.y - &radius),
     ])
 }
 
@@ -886,10 +824,7 @@ struct Bounds {
 }
 
 impl Bounds {
-    fn from_points<K>(points: &[Point2]) -> Result<Self>
-    where
-        K: Kernel,
-    {
+    fn from_points(points: &[Point2]) -> Result<Self> {
         let Some(first) = points.first() else {
             return Err(Error::InvalidInput {
                 reason: "Delaunay point set must be non-empty",
@@ -904,16 +839,16 @@ impl Bounds {
         };
 
         for point in &points[1..] {
-            if K::cmp(&point.x, &bounds.min_x)? == std::cmp::Ordering::Less {
+            if predicates::compare_reals(&point.x, &bounds.min_x)? == std::cmp::Ordering::Less {
                 bounds.min_x = point.x.clone();
             }
-            if K::cmp(&point.x, &bounds.max_x)? == std::cmp::Ordering::Greater {
+            if predicates::compare_reals(&point.x, &bounds.max_x)? == std::cmp::Ordering::Greater {
                 bounds.max_x = point.x.clone();
             }
-            if K::cmp(&point.y, &bounds.min_y)? == std::cmp::Ordering::Less {
+            if predicates::compare_reals(&point.y, &bounds.min_y)? == std::cmp::Ordering::Less {
                 bounds.min_y = point.y.clone();
             }
-            if K::cmp(&point.y, &bounds.max_y)? == std::cmp::Ordering::Greater {
+            if predicates::compare_reals(&point.y, &bounds.max_y)? == std::cmp::Ordering::Greater {
                 bounds.max_y = point.y.clone();
             }
         }
@@ -922,11 +857,8 @@ impl Bounds {
     }
 }
 
-fn make_oriented<K>(points: &[Point2], triangle: Triangle) -> Result<Triangle>
-where
-    K: Kernel,
-{
-    let sign = predicates::orient2d::<K>(
+fn make_oriented(points: &[Point2], triangle: Triangle) -> Result<Triangle> {
+    let sign = predicates::orient2d(
         &points[triangle[0]],
         &points[triangle[1]],
         &points[triangle[2]],
@@ -1143,8 +1075,8 @@ mod tests {
         let points = (0..80)
             .map(|index| p((index * 17) % 83, (index * 29) % 89))
             .collect::<Vec<_>>();
-        let first = brio_insertion_order::<ExactKernel>(&points).unwrap();
-        let second = brio_insertion_order::<ExactKernel>(&points).unwrap();
+        let first = brio_insertion_order(&points).unwrap();
+        let second = brio_insertion_order(&points).unwrap();
         let mut sorted = first.clone();
         sorted.sort_unstable();
 

@@ -1,14 +1,13 @@
 //! Exact ear-clipping polygon triangulation.
 //!
 //! The implementation returns earcut-style flat triangle indices while routing
-//! numeric decisions through the crate's exact predicate kernel. `earcutr` is
+//! numeric decisions through the shared exact predicate pipeline. `earcutr` is
 //! used only as a development-time differential oracle.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{Error, Result};
-use crate::kernel::{ExactKernel, Kernel};
 use crate::polygon::{PolygonRings, RingRange, open_ring_indices, rings_from_hole_indices};
 use crate::predicates;
 use crate::types::Sign;
@@ -17,7 +16,7 @@ use crate::types::{ExactPoint, Point2, TriangleIndices};
 /// Non-certifying diagnostics for the exact earcut hot loop.
 ///
 /// These counters make candidate pressure visible before introducing optional
-/// z-order pruning, unsafe indexing, or additional 2D-specialized kernels.
+/// z-order pruning, unsafe indexing, or additional 2D-specialized schedules.
 /// They are scheduling metadata only: exact predicates still certify topology.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -58,34 +57,11 @@ pub struct EarcutReport {
 
 /// Triangulate an exact polygon.
 pub fn triangulate(vertices: &[ExactPoint], hole_indices: &[usize]) -> Result<TriangleIndices> {
-    triangulate_with_kernel::<ExactKernel>(vertices, hole_indices)
+    Ok(triangulate_report(vertices, hole_indices)?.triangles)
 }
 
 /// Triangulate an exact polygon and return hot-loop diagnostics.
-pub fn triangulate_report(vertices: &[ExactPoint], hole_indices: &[usize]) -> Result<EarcutReport> {
-    triangulate_report_with_kernel::<ExactKernel>(vertices, hole_indices)
-}
-
-/// Triangulate a polygon with the provided numeric kernel.
-pub fn triangulate_with_kernel<K>(
-    vertices: &[Point2],
-    hole_indices: &[usize],
-) -> Result<TriangleIndices>
-where
-    K: Kernel,
-{
-    Ok(triangulate_report_with_kernel::<K>(vertices, hole_indices)?.triangles)
-}
-
-/// Triangulate a polygon with the provided numeric kernel and return hot-loop
-/// diagnostics.
-pub fn triangulate_report_with_kernel<K>(
-    vertices: &[Point2],
-    hole_indices: &[usize],
-) -> Result<EarcutReport>
-where
-    K: Kernel,
-{
+pub fn triangulate_report(vertices: &[Point2], hole_indices: &[usize]) -> Result<EarcutReport> {
     let rings = rings_from_hole_indices(vertices, hole_indices)?;
     let mut diagnostics = EarcutDiagnostics::default();
     // Structural-dispatch note: normalization discovers several facts that are
@@ -93,7 +69,7 @@ where
     // "convex", "monotone", exact-rational coordinate kind, and the count of
     // removed duplicate/collinear vertices would let the public runtime choose
     // fan, monotone partition, earcut, or CDT without re-scanning coordinates.
-    let mut ring = normalized_ring::<K>(vertices, rings.exterior())?;
+    let mut ring = normalized_ring(vertices, rings.exterior())?;
     if ring.len() < 3 {
         return Ok(EarcutReport {
             triangles: Vec::new(),
@@ -109,7 +85,7 @@ where
         });
     }
 
-    let holes = normalized_holes::<K>(vertices, rings.holes(), winding)?;
+    let holes = normalized_holes(vertices, rings.holes(), winding)?;
     if holes.len() == 1
         && let Some(triangles) =
             triangulate_rectangular_annulus(vertices, &ring, &holes[0], winding)?
@@ -122,8 +98,8 @@ where
         });
     }
     if !holes.is_empty() {
-        ring = bridge_holes::<K>(vertices, ring, &holes)?;
-        ring = filter_ring::<K>(vertices, ring)?;
+        ring = bridge_holes(vertices, ring, &holes)?;
+        ring = filter_ring(vertices, ring)?;
         if ring.len() < 3 {
             return Ok(EarcutReport {
                 triangles: Vec::new(),
@@ -132,7 +108,7 @@ where
         }
     }
 
-    let triangles = clip_ring::<K>(vertices, ring, winding, &mut diagnostics)?;
+    let triangles = clip_ring(vertices, ring, winding, &mut diagnostics)?;
     let triangles = if holes.is_empty() {
         triangles
     } else {
@@ -252,24 +228,18 @@ fn ordered_edge(first: usize, second: usize) -> (usize, usize) {
     }
 }
 
-fn normalized_ring<K>(vertices: &[Point2], range: RingRange) -> Result<Vec<usize>>
-where
-    K: Kernel,
-{
-    filter_ring::<K>(vertices, open_ring_indices(vertices, range))
+fn normalized_ring(vertices: &[Point2], range: RingRange) -> Result<Vec<usize>> {
+    filter_ring(vertices, open_ring_indices(vertices, range))
 }
 
-fn normalized_holes<K>(
+fn normalized_holes(
     vertices: &[Point2],
     ranges: &[RingRange],
     exterior_winding: Sign,
-) -> Result<Vec<Vec<usize>>>
-where
-    K: Kernel,
-{
+) -> Result<Vec<Vec<usize>>> {
     let mut holes = Vec::with_capacity(ranges.len());
     for &range in ranges {
-        let mut hole = normalized_ring::<K>(vertices, range)?;
+        let mut hole = normalized_ring(vertices, range)?;
         if hole.len() < 3 {
             return Err(Error::InvalidInput {
                 reason: "hole ring is degenerate",
@@ -436,19 +406,16 @@ fn compare_real_coordinates(
     decide_hyperlimit_ordering(hyperlimit::compare_reals(left, right), "compare_reals")
 }
 
-fn bridge_holes<K>(
+fn bridge_holes(
     vertices: &[Point2],
     mut boundary: Vec<usize>,
     holes: &[Vec<usize>],
-) -> Result<Vec<usize>>
-where
-    K: Kernel,
-{
+) -> Result<Vec<usize>> {
     for hole in holes {
         // A visible diagonal from an exterior boundary to a hole converts a
         // polygon-with-holes into one simple boundary walk without changing the
         // represented region.
-        let bridge = find_visible_bridge::<K>(vertices, &boundary, hole, holes)?;
+        let bridge = find_visible_bridge(vertices, &boundary, hole, holes)?;
         boundary = splice_hole(boundary, hole, bridge.boundary_pos, bridge.hole_pos);
     }
 
@@ -461,21 +428,18 @@ struct Bridge {
     hole_pos: usize,
 }
 
-fn find_visible_bridge<K>(
+fn find_visible_bridge(
     vertices: &[Point2],
     boundary: &[usize],
     hole: &[usize],
     holes: &[Vec<usize>],
-) -> Result<Bridge>
-where
-    K: Kernel,
-{
+) -> Result<Bridge> {
     let hole_positions = positions_by_xy(vertices, hole)?;
 
     for hole_pos in hole_positions {
         let boundary_positions = positions_by_distance_then_xy(vertices, boundary, hole[hole_pos])?;
         for &boundary_pos in &boundary_positions {
-            if bridge_is_visible::<K>(vertices, boundary, hole, holes, boundary_pos, hole_pos)? {
+            if bridge_is_visible(vertices, boundary, hole, holes, boundary_pos, hole_pos)? {
                 return Ok(Bridge {
                     boundary_pos,
                     hole_pos,
@@ -489,24 +453,21 @@ where
     })
 }
 
-fn bridge_is_visible<K>(
+fn bridge_is_visible(
     vertices: &[Point2],
     boundary: &[usize],
     hole: &[usize],
     holes: &[Vec<usize>],
     boundary_pos: usize,
     hole_pos: usize,
-) -> Result<bool>
-where
-    K: Kernel,
-{
+) -> Result<bool> {
     let boundary_index = boundary[boundary_pos];
     let hole_index = hole[hole_pos];
     if points_equal(&vertices[boundary_index], &vertices[hole_index]) {
         return Ok(false);
     }
 
-    let midpoint = K::midpoint(&vertices[boundary_index], &vertices[hole_index])?;
+    let midpoint = predicates::midpoint(&vertices[boundary_index], &vertices[hole_index])?;
     if !predicates::point_in_ring_even_odd(vertices, boundary, &midpoint)? {
         return Ok(false);
     }
@@ -670,10 +631,7 @@ fn compare_point_indices(vertices: &[Point2], left: usize, right: usize) -> Resu
     )
 }
 
-fn filter_ring<K>(vertices: &[Point2], mut ring: Vec<usize>) -> Result<Vec<usize>>
-where
-    K: Kernel,
-{
+fn filter_ring(vertices: &[Point2], mut ring: Vec<usize>) -> Result<Vec<usize>> {
     if ring.len() < 3 {
         return Ok(ring);
     }
@@ -691,7 +649,7 @@ where
             let duplicate = points_equal(&vertices[curr], &vertices[next])
                 || points_equal(&vertices[prev], &vertices[curr]);
             let collinear =
-                predicates::orient2d::<K>(&vertices[prev], &vertices[curr], &vertices[next])?
+                predicates::orient2d(&vertices[prev], &vertices[curr], &vertices[next])?
                     == Sign::Zero;
 
             if duplicate || (collinear && ring.len() > 3) {
@@ -704,7 +662,7 @@ where
     }
 
     if ring.len() == 3
-        && predicates::orient2d::<K>(&vertices[ring[0]], &vertices[ring[1]], &vertices[ring[2]])?
+        && predicates::orient2d(&vertices[ring[0]], &vertices[ring[1]], &vertices[ring[2]])?
             == Sign::Zero
     {
         ring.clear();
@@ -713,41 +671,35 @@ where
     Ok(ring)
 }
 
-fn clip_ring<K>(
+fn clip_ring(
     vertices: &[Point2],
     ring: Vec<usize>,
     winding: Sign,
     diagnostics: &mut EarcutDiagnostics,
-) -> Result<TriangleIndices>
-where
-    K: Kernel,
-{
-    clip_ring_with_splits::<K>(vertices, ring, winding, 0, diagnostics)
+) -> Result<TriangleIndices> {
+    clip_ring_with_splits(vertices, ring, winding, 0, diagnostics)
 }
 
-fn clip_ring_with_splits<K>(
+fn clip_ring_with_splits(
     vertices: &[Point2],
     mut ring: Vec<usize>,
     winding: Sign,
     split_depth: usize,
     diagnostics: &mut EarcutDiagnostics,
-) -> Result<TriangleIndices>
-where
-    K: Kernel,
-{
+) -> Result<TriangleIndices> {
     let mut triangles = Vec::with_capacity((ring.len().saturating_sub(2)) * 3);
     let mut cursor = 0;
     let mut misses = 0;
     let mut guard = ring.len() * ring.len() * 4 + 1;
-    let mut prepared_convex = prepare_local_convexity::<K>(vertices, &ring, winding, diagnostics)?;
+    let mut prepared_convex = prepare_local_convexity(vertices, &ring, winding, diagnostics)?;
 
     while ring.len() > 3 {
         if guard == 0 {
             let (cured_ring, mut cured_triangles, cured) =
-                cure_local_intersections::<K>(vertices, ring, winding)?;
+                cure_local_intersections(vertices, ring, winding)?;
             if cured {
                 triangles.append(&mut cured_triangles);
-                triangles.append(&mut clip_ring_with_splits::<K>(
+                triangles.append(&mut clip_ring_with_splits(
                     vertices,
                     cured_ring,
                     winding,
@@ -756,11 +708,11 @@ where
                 )?);
                 return Ok(triangles);
             }
-            return split_or_fail::<K>(vertices, cured_ring, winding, split_depth, diagnostics);
+            return split_or_fail(vertices, cured_ring, winding, split_depth, diagnostics);
         }
         guard -= 1;
 
-        if is_ear::<K>(vertices, &ring, &prepared_convex, cursor, diagnostics)? {
+        if is_ear(vertices, &ring, &prepared_convex, cursor, diagnostics)? {
             let len = ring.len();
             let prev = ring[(cursor + len - 1) % len];
             let curr = ring[cursor];
@@ -772,7 +724,7 @@ where
             if cursor == ring.len() {
                 cursor = 0;
             }
-            update_prepared_convexity_after_clip::<K>(
+            update_prepared_convexity_after_clip(
                 vertices,
                 &ring,
                 &mut prepared_convex,
@@ -789,21 +741,21 @@ where
 
         if misses > ring.len() {
             let previous_len = ring.len();
-            ring = filter_ring::<K>(vertices, ring)?;
+            ring = filter_ring(vertices, ring)?;
             if ring.len() < 3 {
                 return Ok(triangles);
             }
-            prepared_convex = prepare_local_convexity::<K>(vertices, &ring, winding, diagnostics)?;
+            prepared_convex = prepare_local_convexity(vertices, &ring, winding, diagnostics)?;
             if ring.len() == previous_len {
                 let (cured_ring, mut cured_triangles, cured) =
-                    cure_local_intersections::<K>(vertices, ring, winding)?;
+                    cure_local_intersections(vertices, ring, winding)?;
                 triangles.append(&mut cured_triangles);
                 if cured {
                     diagnostics.local_intersection_cures += 1;
                     diagnostics.emitted_triangles += cured_triangles.len() / 3;
                     ring = cured_ring;
                     prepared_convex =
-                        prepare_local_convexity::<K>(vertices, &ring, winding, diagnostics)?;
+                        prepare_local_convexity(vertices, &ring, winding, diagnostics)?;
                     cursor = 0;
                     misses = 0;
                     guard = ring.len() * ring.len() * 4 + 1;
@@ -811,7 +763,7 @@ where
                 }
 
                 let mut split_triangles =
-                    split_or_fail::<K>(vertices, cured_ring, winding, split_depth, diagnostics)?;
+                    split_or_fail(vertices, cured_ring, winding, split_depth, diagnostics)?;
                 triangles.append(&mut split_triangles);
                 return Ok(triangles);
             }
@@ -820,7 +772,7 @@ where
         }
     }
 
-    let sign = K::orient2d(&vertices[ring[0]], &vertices[ring[1]], &vertices[ring[2]])?;
+    let sign = predicates::orient2d(&vertices[ring[0]], &vertices[ring[1]], &vertices[ring[2]])?;
     if sign != Sign::Zero {
         push_triangle(&mut triangles, ring[0], ring[1], ring[2], sign);
         diagnostics.emitted_triangles += 1;
@@ -829,14 +781,11 @@ where
     Ok(triangles)
 }
 
-fn cure_local_intersections<K>(
+fn cure_local_intersections(
     vertices: &[Point2],
     ring: Vec<usize>,
     _winding: Sign,
-) -> Result<(Vec<usize>, TriangleIndices, bool)>
-where
-    K: Kernel,
-{
+) -> Result<(Vec<usize>, TriangleIndices, bool)> {
     if ring.len() < 4 {
         return Ok((ring, TriangleIndices::new(), false));
     }
@@ -848,7 +797,7 @@ where
         let q_pos = (cursor + 1) % len;
         let b_pos = (cursor + 2) % len;
 
-        if local_intersection_is_curable::<K>(vertices, &ring, a_pos, p_pos, q_pos, b_pos)? {
+        if local_intersection_is_curable(vertices, &ring, a_pos, p_pos, q_pos, b_pos)? {
             let a = ring[a_pos];
             let p = ring[p_pos];
             let b = ring[b_pos];
@@ -860,7 +809,7 @@ where
             // orientation tests replace earcutr's floating-point tests.
             remove_adjacent_positions(&mut cured_ring, p_pos, q_pos);
 
-            let sign = predicates::orient2d::<K>(&vertices[a], &vertices[p], &vertices[b])?;
+            let sign = predicates::orient2d(&vertices[a], &vertices[p], &vertices[b])?;
             if sign == Sign::Zero {
                 return Ok((ring, TriangleIndices::new(), false));
             }
@@ -874,17 +823,14 @@ where
     Ok((ring, TriangleIndices::new(), false))
 }
 
-fn local_intersection_is_curable<K>(
+fn local_intersection_is_curable(
     vertices: &[Point2],
     ring: &[usize],
     a_pos: usize,
     p_pos: usize,
     q_pos: usize,
     b_pos: usize,
-) -> Result<bool>
-where
-    K: Kernel,
-{
+) -> Result<bool> {
     let a = ring[a_pos];
     let p = ring[p_pos];
     let q = ring[q_pos];
@@ -900,7 +846,7 @@ where
         return Ok(false);
     }
 
-    if predicates::orient2d::<K>(&vertices[a], &vertices[p], &vertices[b])? == Sign::Zero {
+    if predicates::orient2d(&vertices[a], &vertices[p], &vertices[b])? == Sign::Zero {
         return Ok(false);
     }
 
@@ -956,22 +902,19 @@ fn remove_adjacent_positions(ring: &mut Vec<usize>, first: usize, second: usize)
     }
 }
 
-fn split_or_fail<K>(
+fn split_or_fail(
     vertices: &[Point2],
     ring: Vec<usize>,
     winding: Sign,
     split_depth: usize,
     diagnostics: &mut EarcutDiagnostics,
-) -> Result<TriangleIndices>
-where
-    K: Kernel,
-{
+) -> Result<TriangleIndices> {
     if split_depth > ring.len() {
         return Err(Error::NoEarFound);
     }
     diagnostics.split_fallbacks += 1;
 
-    let Some((first, second)) = find_split_diagonal::<K>(vertices, &ring)? else {
+    let Some((first, second)) = find_split_diagonal(vertices, &ring)? else {
         return Err(Error::NoEarFound);
     };
 
@@ -980,12 +923,12 @@ where
     // are exact: the diagonal must not cross the boundary, and its midpoint
     // must lie inside the represented region.
     let (mut left, mut right) = split_ring(&ring, first, second);
-    left = filter_ring::<K>(vertices, left)?;
-    right = filter_ring::<K>(vertices, right)?;
+    left = filter_ring(vertices, left)?;
+    right = filter_ring(vertices, right)?;
 
     let mut triangles = TriangleIndices::new();
     if left.len() >= 3 {
-        triangles.append(&mut clip_ring_with_splits::<K>(
+        triangles.append(&mut clip_ring_with_splits(
             vertices,
             left,
             winding,
@@ -994,7 +937,7 @@ where
         )?);
     }
     if right.len() >= 3 {
-        triangles.append(&mut clip_ring_with_splits::<K>(
+        triangles.append(&mut clip_ring_with_splits(
             vertices,
             right,
             winding,
@@ -1006,17 +949,14 @@ where
     Ok(triangles)
 }
 
-fn find_split_diagonal<K>(vertices: &[Point2], ring: &[usize]) -> Result<Option<(usize, usize)>>
-where
-    K: Kernel,
-{
+fn find_split_diagonal(vertices: &[Point2], ring: &[usize]) -> Result<Option<(usize, usize)>> {
     for gap in 2..ring.len().saturating_sub(1) {
         for first in 0..ring.len() {
             let second = (first + gap) % ring.len();
             if positions_are_adjacent(ring.len(), first, second) {
                 continue;
             }
-            if diagonal_is_valid::<K>(vertices, ring, first, second)? {
+            if diagonal_is_valid(vertices, ring, first, second)? {
                 return Ok(Some(ordered_positions(first, second)));
             }
         }
@@ -1025,15 +965,12 @@ where
     Ok(None)
 }
 
-fn diagonal_is_valid<K>(
+fn diagonal_is_valid(
     vertices: &[Point2],
     ring: &[usize],
     first_pos: usize,
     second_pos: usize,
-) -> Result<bool>
-where
-    K: Kernel,
-{
+) -> Result<bool> {
     let first = ring[first_pos];
     let second = ring[second_pos];
     if same_point(vertices, first, second) {
@@ -1044,7 +981,7 @@ where
         return Ok(false);
     }
 
-    let midpoint = K::midpoint(&vertices[first], &vertices[second])?;
+    let midpoint = predicates::midpoint(&vertices[first], &vertices[second])?;
     predicates::point_in_ring_even_odd(vertices, ring, &midpoint)
 }
 
@@ -1072,16 +1009,13 @@ fn ordered_positions(first: usize, second: usize) -> (usize, usize) {
     }
 }
 
-fn is_ear<K>(
+fn is_ear(
     vertices: &[Point2],
     ring: &[usize],
     prepared_convex: &[bool],
     cursor: usize,
     diagnostics: &mut EarcutDiagnostics,
-) -> Result<bool>
-where
-    K: Kernel,
-{
+) -> Result<bool> {
     diagnostics.ear_tests += 1;
     let len = ring.len();
     let prev = ring[(cursor + len - 1) % len];
@@ -1124,7 +1058,7 @@ where
         }
 
         diagnostics.containment_tests += 1;
-        if predicates::point_in_or_on_triangle::<K>(
+        if predicates::point_in_or_on_triangle(
             &vertices[prev],
             &vertices[curr],
             &vertices[next],
@@ -1137,56 +1071,46 @@ where
     Ok(true)
 }
 
-fn prepare_local_convexity<K>(
+fn prepare_local_convexity(
     vertices: &[Point2],
     ring: &[usize],
     winding: Sign,
     diagnostics: &mut EarcutDiagnostics,
-) -> Result<Vec<bool>>
-where
-    K: Kernel,
-{
+) -> Result<Vec<bool>> {
     diagnostics.prepared_reflex_rebuilds += 1;
     (0..ring.len())
-        .map(|cursor| local_vertex_is_strictly_convex::<K>(vertices, ring, cursor, winding))
+        .map(|cursor| local_vertex_is_strictly_convex(vertices, ring, cursor, winding))
         .collect()
 }
 
-fn update_prepared_convexity_after_clip<K>(
+fn update_prepared_convexity_after_clip(
     vertices: &[Point2],
     ring: &[usize],
     prepared_convex: &mut [bool],
     cursor: usize,
     winding: Sign,
     diagnostics: &mut EarcutDiagnostics,
-) -> Result<()>
-where
-    K: Kernel,
-{
+) -> Result<()> {
     if ring.len() < 3 {
         return Ok(());
     }
     let next = cursor % ring.len();
     let prev = (next + ring.len() - 1) % ring.len();
-    prepared_convex[prev] = local_vertex_is_strictly_convex::<K>(vertices, ring, prev, winding)?;
+    prepared_convex[prev] = local_vertex_is_strictly_convex(vertices, ring, prev, winding)?;
     diagnostics.prepared_reflex_updates += 1;
     if next != prev {
-        prepared_convex[next] =
-            local_vertex_is_strictly_convex::<K>(vertices, ring, next, winding)?;
+        prepared_convex[next] = local_vertex_is_strictly_convex(vertices, ring, next, winding)?;
         diagnostics.prepared_reflex_updates += 1;
     }
     Ok(())
 }
 
-fn local_vertex_is_strictly_convex<K>(
+fn local_vertex_is_strictly_convex(
     vertices: &[Point2],
     ring: &[usize],
     cursor: usize,
     winding: Sign,
-) -> Result<bool>
-where
-    K: Kernel,
-{
+) -> Result<bool> {
     // Standard ear-clipping implementations only need to test reflex vertices
     // for containment in a candidate ear. Hypertri prepares that local
     // convex/reflex bit once per active ring state, then updates only the two
@@ -1197,7 +1121,7 @@ where
     let prev = ring[(cursor + len - 1) % len];
     let curr = ring[cursor];
     let next = ring[(cursor + 1) % len];
-    Ok(predicates::orient2d::<K>(&vertices[prev], &vertices[curr], &vertices[next])? == winding)
+    Ok(predicates::orient2d(&vertices[prev], &vertices[curr], &vertices[next])? == winding)
 }
 
 fn point_in_triangle_bbox(a: &Point2, b: &Point2, c: &Point2, point: &Point2) -> Result<bool> {
@@ -1205,7 +1129,7 @@ fn point_in_triangle_bbox(a: &Point2, b: &Point2, c: &Point2, point: &Point2) ->
     // a point outside the triangle's axis-aligned bounding box cannot be inside
     // the triangle, while points inside the box still go through the exact
     // orientation-based containment predicate. The box is evaluated with the
-    // crate's exact kernel rather than primitive floats.
+    // exact predicate pipeline rather than primitive floats.
     decide_hyperlimit_bool(
         hyperlimit::point_in_triangle2_aabb(
             &predicate_point(a),
@@ -1291,7 +1215,6 @@ fn map_hyperlimit_sign(sign: hyperlimit::Sign) -> Sign {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::ExactKernel;
     use crate::types::Real;
 
     fn exact_point(x: i32, y: i32) -> ExactPoint {
@@ -1329,7 +1252,7 @@ mod tests {
             exact_point(0, 2),
         ];
 
-        let triangles = triangulate_with_kernel::<ExactKernel>(&vertices, &[]).unwrap();
+        let triangles = triangulate(&vertices, &[]).unwrap();
 
         assert_eq!(triangles.len(), 9);
     }
@@ -1631,8 +1554,7 @@ mod tests {
 
         let mut diagnostics = EarcutDiagnostics::default();
         let triangles =
-            split_or_fail::<ExactKernel>(&vertices, ring, Sign::Positive, 0, &mut diagnostics)
-                .unwrap();
+            split_or_fail(&vertices, ring, Sign::Positive, 0, &mut diagnostics).unwrap();
 
         assert_eq!(triangles.len(), 12);
         assert_eq!(diagnostics.split_fallbacks, 1);
@@ -1652,7 +1574,7 @@ mod tests {
         let ring = vec![0, 1, 2, 3, 4, 5];
 
         let (cured_ring, triangles, cured) =
-            cure_local_intersections::<ExactKernel>(&vertices, ring, Sign::Positive).unwrap();
+            cure_local_intersections(&vertices, ring, Sign::Positive).unwrap();
 
         assert!(cured);
         assert_eq!(cured_ring, vec![0, 3, 4, 5]);

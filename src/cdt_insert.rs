@@ -6,11 +6,9 @@
 //! crossing constraints into exact Steiner vertices, recovers each protected
 //! subsegment by flipping crossed unconstrained edges, then re-legalizes only
 //! unconstrained edges. Correctness reduces to local Delaunay checks on
-//! unprotected edges; exact predicate ownership stays in the kernel/predicate
-//! layer.
+//! unprotected edges; exact predicate ownership stays in `hyperlimit`.
 
 use crate::error::{Error, Result};
-use crate::kernel::Kernel;
 use crate::predicates;
 use crate::types::Sign;
 use crate::types::{Constraint, Point2, Triangle};
@@ -31,14 +29,11 @@ pub(crate) struct PlanarConstraints {
 /// every requested segment as a triangulation edge and restores local Delaunay
 /// legality for unconstrained interior edges where exact predicates can decide
 /// the required flips.
-pub(crate) fn insert_constraints<K>(
+pub(crate) fn insert_constraints(
     points: &[Point2],
     mut triangles: Vec<Triangle>,
     constraints: &[Constraint],
-) -> Result<Vec<Triangle>>
-where
-    K: Kernel,
-{
+) -> Result<Vec<Triangle>> {
     // Structural-dispatch note: constraint recovery processes the planarized
     // subsegments in caller-derived order. The retained PSLG facts already
     // keep intersection vertices and split subsegments explicit; richer
@@ -54,12 +49,12 @@ where
             continue;
         }
 
-        recover_constraint::<K>(points, &mut triangles, constraint, &constrained_edges)?;
+        recover_constraint(points, &mut triangles, constraint, &constrained_edges)?;
         push_unique_edge(&mut constrained_edges, edge);
-        legalize_unconstrained_edges::<K>(points, &mut triangles, &constrained_edges)?;
+        legalize_unconstrained_edges(points, &mut triangles, &constrained_edges)?;
     }
 
-    legalize_unconstrained_edges::<K>(points, &mut triangles, &constrained_edges)?;
+    legalize_unconstrained_edges(points, &mut triangles, &constrained_edges)?;
     Ok(triangles)
 }
 
@@ -240,15 +235,12 @@ fn push_unique_constraint(constraints: &mut Vec<Constraint>, constraint: Constra
     }
 }
 
-fn recover_constraint<K>(
+fn recover_constraint(
     points: &[Point2],
     triangles: &mut [Triangle],
     constraint: Constraint,
     constrained_edges: &[EdgeKey],
-) -> Result<()>
-where
-    K: Kernel,
-{
+) -> Result<()> {
     let target = EdgeKey::new(constraint.from, constraint.to);
     let max_flips = flip_budget(points.len(), triangles.len());
 
@@ -277,7 +269,7 @@ where
             });
         }
 
-        if !flip_edge::<K>(points, triangles, crossing_edge)? {
+        if !flip_edge(points, triangles, crossing_edge)? {
             return Err(Error::UnsupportedFeature {
                 feature: "constraint recovery across a non-convex edge cavity",
             });
@@ -318,14 +310,11 @@ fn first_edge_crossing_constraint(
     Ok(None)
 }
 
-fn legalize_unconstrained_edges<K>(
+fn legalize_unconstrained_edges(
     points: &[Point2],
     triangles: &mut [Triangle],
     constrained_edges: &[EdgeKey],
-) -> Result<()>
-where
-    K: Kernel,
-{
+) -> Result<()> {
     let max_flips = flip_budget(points.len(), triangles.len()) * 4;
 
     for _ in 0..max_flips {
@@ -340,13 +329,13 @@ where
             };
 
             let new_edge = EdgeKey::new(first.opposite, second.opposite);
-            if !edge_is_illegal::<K>(points, edge, first.opposite, second.opposite)? {
+            if !edge_is_illegal(points, edge, first.opposite, second.opposite)? {
                 continue;
             }
             if !flip_preserves_constraints(points, new_edge, constrained_edges)? {
                 continue;
             }
-            if flip_edge::<K>(points, triangles, edge)? {
+            if flip_edge(points, triangles, edge)? {
                 flipped = true;
                 break;
             }
@@ -362,20 +351,17 @@ where
     })
 }
 
-fn edge_is_illegal<K>(
+fn edge_is_illegal(
     points: &[Point2],
     edge: EdgeKey,
     first_opposite: usize,
     second_opposite: usize,
-) -> Result<bool>
-where
-    K: Kernel,
-{
-    if !edge_is_flippable::<K>(points, edge, first_opposite, second_opposite)? {
+) -> Result<bool> {
+    if !edge_is_flippable(points, edge, first_opposite, second_opposite)? {
         return Ok(false);
     }
 
-    let orientation = predicates::orient2d::<K>(
+    let orientation = predicates::orient2d(
         &points[edge.from],
         &points[edge.to],
         &points[first_opposite],
@@ -384,7 +370,7 @@ where
         return Ok(false);
     }
 
-    let incircle = K::incircle2d(
+    let incircle = predicates::incircle2d(
         &points[edge.from],
         &points[edge.to],
         &points[first_opposite],
@@ -397,34 +383,28 @@ where
     ))
 }
 
-fn flip_edge<K>(points: &[Point2], triangles: &mut [Triangle], edge: EdgeKey) -> Result<bool>
-where
-    K: Kernel,
-{
+fn flip_edge(points: &[Point2], triangles: &mut [Triangle], edge: EdgeKey) -> Result<bool> {
     let Some([first, second]) = two_adjacent_triangles(triangles, edge)? else {
         return Ok(false);
     };
 
-    if !edge_is_flippable::<K>(points, edge, first.opposite, second.opposite)? {
+    if !edge_is_flippable(points, edge, first.opposite, second.opposite)? {
         return Ok(false);
     }
 
-    let first_new = make_oriented::<K>(points, [first.opposite, second.opposite, edge.from])?;
-    let second_new = make_oriented::<K>(points, [second.opposite, first.opposite, edge.to])?;
+    let first_new = make_oriented(points, [first.opposite, second.opposite, edge.from])?;
+    let second_new = make_oriented(points, [second.opposite, first.opposite, edge.to])?;
     triangles[first.triangle] = first_new;
     triangles[second.triangle] = second_new;
     Ok(true)
 }
 
-fn edge_is_flippable<K>(
+fn edge_is_flippable(
     points: &[Point2],
     edge: EdgeKey,
     first_opposite: usize,
     second_opposite: usize,
-) -> Result<bool>
-where
-    K: Kernel,
-{
+) -> Result<bool> {
     if first_opposite == second_opposite
         || edge.contains(first_opposite)
         || edge.contains(second_opposite)
@@ -432,22 +412,22 @@ where
         return Ok(false);
     }
 
-    let first_side = predicates::orient2d::<K>(
+    let first_side = predicates::orient2d(
         &points[edge.from],
         &points[edge.to],
         &points[first_opposite],
     )?;
-    let second_side = predicates::orient2d::<K>(
+    let second_side = predicates::orient2d(
         &points[edge.from],
         &points[edge.to],
         &points[second_opposite],
     )?;
-    let opposite_edge_side = predicates::orient2d::<K>(
+    let opposite_edge_side = predicates::orient2d(
         &points[first_opposite],
         &points[second_opposite],
         &points[edge.from],
     )?;
-    let opposite_other_side = predicates::orient2d::<K>(
+    let opposite_other_side = predicates::orient2d(
         &points[first_opposite],
         &points[second_opposite],
         &points[edge.to],
@@ -535,11 +515,8 @@ fn two_adjacent_triangles(
     }
 }
 
-fn make_oriented<K>(points: &[Point2], mut triangle: Triangle) -> Result<Triangle>
-where
-    K: Kernel,
-{
-    let sign = predicates::orient2d::<K>(
+fn make_oriented(points: &[Point2], mut triangle: Triangle) -> Result<Triangle> {
+    let sign = predicates::orient2d(
         &points[triangle[0]],
         &points[triangle[1]],
         &points[triangle[2]],

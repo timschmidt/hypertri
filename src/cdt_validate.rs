@@ -7,7 +7,6 @@
 //! the same empty-circle predicate used by Delaunay insertion.
 
 use crate::error::{Error, Result};
-use crate::kernel::{ExactKernel, Kernel};
 use crate::predicates;
 use crate::types::Sign;
 use crate::types::{Constraint, ExactPoint, Triangle};
@@ -83,7 +82,7 @@ fn validate_triangles(points: &[ExactPoint], triangles: &[Triangle]) -> Result<(
                 reason: "triangle index out of bounds",
             });
         }
-        if predicates::orient2d::<ExactKernel>(
+        if predicates::orient2d(
             &points[triangle[0]],
             &points[triangle[1]],
             &points[triangle[2]],
@@ -154,7 +153,7 @@ fn edge_is_illegal(
     first_opposite: usize,
     second_opposite: usize,
 ) -> Result<bool> {
-    let orientation = predicates::orient2d::<ExactKernel>(
+    let orientation = predicates::orient2d(
         &points[edge.from],
         &points[edge.to],
         &points[first_opposite],
@@ -163,7 +162,7 @@ fn edge_is_illegal(
         return Ok(false);
     }
 
-    let sign = ExactKernel::incircle2d(
+    let sign = predicates::incircle2d(
         &points[edge.from],
         &points[edge.to],
         &points[first_opposite],
@@ -181,10 +180,8 @@ fn opposite_sides_of_edge(
     first: usize,
     second: usize,
 ) -> Result<bool> {
-    let first_side =
-        predicates::orient2d::<ExactKernel>(&points[edge.from], &points[edge.to], &points[first])?;
-    let second_side =
-        predicates::orient2d::<ExactKernel>(&points[edge.from], &points[edge.to], &points[second])?;
+    let first_side = predicates::orient2d(&points[edge.from], &points[edge.to], &points[first])?;
+    let second_side = predicates::orient2d(&points[edge.from], &points[edge.to], &points[second])?;
     Ok(signs_strictly_differ(first_side, second_side))
 }
 
